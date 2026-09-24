@@ -1,5 +1,8 @@
 """剪贴板历史小工具：自动记下最近复制的 8 条文字，可以搜索，也能一键复制回去。
 
+在 Windows 上它会一直在后台运行：开机自动启动，关掉窗口也照样记录；
+在任何地方按 Ctrl+Shift+V 就能叫出来，选好后自动粘贴。
+
 运行方法：python clipboard_history.py
 """
 
@@ -8,7 +11,9 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import subprocess
 import sys
+import threading
 import time
 import tkinter as tk
 from dataclasses import asdict, dataclass, field
@@ -17,11 +22,19 @@ from pathlib import Path
 from tkinter import font as tkfont
 from tkinter import messagebox, ttk
 
+if sys.platform == "win32":
+    import winreg
+    from ctypes import wintypes
+
 MAX_ITEMS = 8  # 最多保留几条，再多就把最旧的删掉
 POLL_INTERVAL_MS = 500  # 每隔多久看一次剪贴板
+HOTKEY_POLL_MS = 50  # 每隔多久看一次快捷键有没有被按下
+PASTE_DELAY_MS = 150  # 切回原来的窗口后稍等一下再粘贴，给它时间拿到焦点
 PREVIEW_LIMIT = 20_000  # 预览区最多显示的字数（复制回去时仍然是完整内容）
 DATA_FILE = Path.home() / ".clipboard_history.json"
+HOTKEY_NAME = "Ctrl+Shift+V"
 TIP = "双击或回车：复制回剪贴板    Delete：删除    Esc：清空搜索"
+TIP_BACKGROUND = f"{HOTKEY_NAME}：随时呼出    回车：用这条    Esc：收起"
 
 
 @dataclass
@@ -37,6 +50,7 @@ class ClipboardHistory:
         self.max_items = max_items
         self.path = path
         self.items: list[Entry] = []
+        self.settings: dict = {}  # 顺便记几个小设置，比如要不要开机自启
 
     def add(self, text: str) -> bool:
         """记下一条新复制的内容，返回列表有没有变化。
@@ -72,18 +86,21 @@ class ClipboardHistory:
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
             items = [Entry(str(item["text"]), float(item["copied_at"])) for item in data["items"]]
+            settings = data.get("settings", {})
         except (OSError, ValueError, KeyError, TypeError):
             return
         self.items = items[: self.max_items]
+        self.settings = settings if isinstance(settings, dict) else {}
 
     def save(self) -> None:
         """先写临时文件再替换，写到一半断电也不会把历史弄坏。"""
         if self.path is None:
             return
         tmp = self.path.with_name(self.path.name + ".tmp")
+        data = {"items": [asdict(entry) for entry in self.items], "settings": self.settings}
         # 剪贴板里可能有密码之类的内容，文件只给自己读写
         with open(tmp, "w", encoding="utf-8", opener=lambda p, f: os.open(p, f, 0o600)) as file:
-            json.dump({"items": [asdict(entry) for entry in self.items]}, file, indent=2)
+            json.dump(data, file, indent=2)
         os.replace(tmp, self.path)
 
 
@@ -99,12 +116,116 @@ def format_time(timestamp: float) -> str:
     return moment.strftime("%m-%d %H:%M")
 
 
+def windowless_python() -> Path:
+    """Windows 上不带黑色命令行窗口的 Python（pythonw.exe），找不到就用当前这个。"""
+    pythonw = Path(sys.executable).with_name("pythonw.exe")
+    return pythonw if pythonw.exists() else Path(sys.executable)
+
+
+class WindowsDesktop:
+    """只在 Windows 上用：全局快捷键、切回原来的窗口自动粘贴、开机自启、只运行一份。"""
+
+    MOD_CONTROL, MOD_SHIFT, MOD_NOREPEAT = 0x0002, 0x0004, 0x4000
+    VK_CONTROL, VK_SHIFT, VK_V = 0x11, 0x10, 0x56
+    WM_HOTKEY, KEYEVENTF_KEYUP, ERROR_ALREADY_EXISTS = 0x0312, 0x0002, 183
+    RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+    AUTOSTART_NAME = "ClipboardHistory"
+
+    def __init__(self) -> None:
+        self.hotkey_pressed = threading.Event()
+        self.hotkey_ok = False
+        self._mutex = None
+        user32 = self.user32 = ctypes.WinDLL("user32")
+        user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
+        user32.GetMessageW.argtypes = [
+            ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT
+        ]
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        user32.keybd_event.argtypes = [ctypes.c_ubyte, ctypes.c_ubyte, wintypes.DWORD, ctypes.c_size_t]
+
+    def claim_single_instance(self) -> bool:
+        """占住一个名字；已经有一份在运行时返回 False。"""
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+        self._mutex = kernel32.CreateMutexW(None, False, "ClipboardHistory.SingleInstance")
+        return ctypes.get_last_error() != self.ERROR_ALREADY_EXISTS
+
+    def start_hotkey(self) -> None:
+        registered = threading.Event()
+        threading.Thread(target=self._listen, args=(registered,), daemon=True).start()
+        registered.wait(2)
+
+    def _listen(self, registered: threading.Event) -> None:
+        # 快捷键在哪个线程注册，按下时的消息就发给哪个线程，所以注册和收消息都在这个后台线程里
+        modifiers = self.MOD_CONTROL | self.MOD_SHIFT | self.MOD_NOREPEAT
+        self.hotkey_ok = bool(self.user32.RegisterHotKey(None, 1, modifiers, self.VK_V))
+        registered.set()
+        if not self.hotkey_ok:
+            return
+        msg = wintypes.MSG()
+        while self.user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            if msg.message == self.WM_HOTKEY:
+                self.hotkey_pressed.set()
+
+    def foreground(self) -> int:
+        return self.user32.GetForegroundWindow() or 0
+
+    def is_ours(self, hwnd: int) -> bool:
+        """这个窗口是不是本程序的（主窗口、确认框都算）。"""
+        pid = wintypes.DWORD()
+        self.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return pid.value == os.getpid()
+
+    def activate(self, hwnd: int) -> None:
+        self.user32.SetForegroundWindow(hwnd)
+
+    def paste(self) -> None:
+        """替用户按一下 Ctrl+V。"""
+        self._press(self.VK_CONTROL, self.VK_V)
+
+    def press_hotkey(self) -> None:
+        """替用户按一下 Ctrl+Shift+V，用来叫出已经在运行的那一份。"""
+        self._press(self.VK_CONTROL, self.VK_SHIFT, self.VK_V)
+
+    def _press(self, *keys: int) -> None:
+        for key in keys:
+            self.user32.keybd_event(key, 0, 0, 0)
+        for key in reversed(keys):
+            self.user32.keybd_event(key, 0, self.KEYEVENTF_KEYUP, 0)
+
+    @property
+    def autostart(self) -> bool:
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self.RUN_KEY) as key:
+                winreg.QueryValueEx(key, self.AUTOSTART_NAME)
+        except OSError:
+            return False
+        return True
+
+    def set_autostart(self, enabled: bool) -> None:
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, self.RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+            if enabled:
+                # 开机时用 pythonw 在后台启动，不弹窗口
+                command = f'"{windowless_python()}" "{Path(__file__).resolve()}" --hidden'
+                winreg.SetValueEx(key, self.AUTOSTART_NAME, 0, winreg.REG_SZ, command)
+            elif self.autostart:
+                winreg.DeleteValue(key, self.AUTOSTART_NAME)
+
+
 class ClipboardHistoryApp:
-    def __init__(self, root: tk.Tk, history: ClipboardHistory) -> None:
+    def __init__(
+        self, root: tk.Tk, history: ClipboardHistory, desktop: WindowsDesktop | None = None
+    ) -> None:
         self.root = root
         self.history = history
+        self.desktop = desktop  # 只有 Windows 上才有：快捷键、后台运行、开机自启
         self._visible: list[Entry] = []  # 列表里正在显示的记录（搜索过滤之后）
         self._status_job: str | None = None
+        self._paste_target: int | None = None  # 按快捷键之前正在用的窗口，选好后粘贴回去
+        self._picker_seen = False  # 呼出之后，窗口是不是已经到最前面了
         self._build_ui()
         self._bind_keys()
         # 打开之前就在剪贴板里的内容不算新复制的，免得删掉的记录重启后又冒出来
@@ -112,6 +233,19 @@ class ClipboardHistoryApp:
         self._refresh()
         self.search_box.focus_set()
         self.root.after(POLL_INTERVAL_MS, self._poll_clipboard)
+        if desktop is not None:
+            self._apply_autostart_setting()
+            # 点 × 只是藏到后台：关掉窗口也照样记录，快捷键也照样能用
+            root.protocol("WM_DELETE_WINDOW", self._on_close)
+            self.root.after(HOTKEY_POLL_MS, self._poll_hotkey)
+
+    @property
+    def _tip(self) -> str:
+        if self.desktop is None:
+            return TIP
+        if self.desktop.hotkey_ok:
+            return TIP_BACKGROUND
+        return f"{HOTKEY_NAME} 被别的程序占用了，快捷键暂时用不了"
 
     def _build_ui(self) -> None:
         root = self.root
@@ -128,14 +262,20 @@ class ClipboardHistoryApp:
         frame.pack(fill="both", expand=True)
 
         # 底部的状态栏和按钮先摆上，窗口变小时优先压缩预览区
-        self.status = ttk.Label(frame, text=TIP, foreground="gray")
+        self.status = ttk.Label(frame, text=self._tip, foreground="gray")
         self.status.pack(side="bottom", fill="x", pady=(8, 0))
 
         buttons = ttk.Frame(frame)
         buttons.pack(side="bottom", fill="x", pady=(10, 0))
-        ttk.Button(buttons, text="复制", command=self.copy_selected).pack(side="left")
-        ttk.Button(buttons, text="删除", command=self.delete_selected).pack(side="left", padx=6)
-        ttk.Button(buttons, text="清空", command=self.clear_all).pack(side="left")
+        ttk.Button(buttons, text="复制", width=6, command=self.copy_selected).pack(side="left")
+        ttk.Button(buttons, text="删除", width=6, command=self.delete_selected).pack(side="left", padx=6)
+        ttk.Button(buttons, text="清空", width=6, command=self.clear_all).pack(side="left")
+        if self.desktop is not None:
+            ttk.Button(buttons, text="退出", width=6, command=root.destroy).pack(side="left", padx=6)
+            self.autostart = tk.BooleanVar(value=False)
+            ttk.Checkbutton(
+                buttons, text="开机自启", variable=self.autostart, command=self._toggle_autostart
+            ).pack(side="right", padx=(10, 0))
         self.topmost = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             buttons,
@@ -207,7 +347,7 @@ class ClipboardHistoryApp:
         self.search_box.bind("<Up>", lambda _e: self._move_selection(-1))
         # 点一下预览区让它拿到焦点，这样可以选中一部分文字再 Ctrl+C
         self.preview.bind("<Button-1>", lambda _e: self.preview.focus_set())
-        self.root.bind("<Escape>", lambda _e: self._reset_search())
+        self.root.bind("<Escape>", lambda _e: self._on_escape())
         self.root.bind("<Command-f>" if is_mac else "<Control-f>", lambda _e: self.search_box.focus_set())
 
     # ---- 剪贴板 ----
@@ -234,6 +374,90 @@ class ClipboardHistoryApp:
             self._save()
             self._refresh(select=text)
 
+    # ---- 后台运行和快捷键（Windows） ----
+
+    def _poll_hotkey(self) -> None:
+        try:
+            self.check_hotkey()
+        finally:
+            self.root.after(HOTKEY_POLL_MS, self._poll_hotkey)
+
+    def check_hotkey(self) -> None:
+        """处理快捷键；呼出后如果用户点去了别的窗口，就像 Win+V 一样自动收起。"""
+        front = self.desktop.foreground()
+        ours = self.desktop.is_ours(front)
+        if self.desktop.hotkey_pressed.is_set():
+            self.desktop.hotkey_pressed.clear()
+            if ours and self.root.state() in ("normal", "zoomed"):
+                self.hide()  # 窗口已经在最前面了，再按一次就收起
+            else:
+                self.summon(None if ours else front)
+        elif self._paste_target is not None:
+            if ours:
+                self._picker_seen = True
+            elif self._picker_seen:
+                self._paste_target = None
+                self.root.withdraw()
+
+    def summon(self, target: int | None) -> None:
+        """快捷键呼出：记住刚才在用的窗口，选好后自动粘贴回去。"""
+        self._paste_target = target
+        self._picker_seen = False
+        self.query.set("")
+        self.root.deiconify()
+        self.root.update_idletasks()  # 开机后第一次呼出时窗口还没画出来，先画好再抢焦点
+        self.root.lift()
+        self.root.focus_force()
+        self.search_box.focus_set()
+        if self._visible:
+            self.tree.selection_set("0")
+            self.tree.see("0")
+
+    def hide(self, paste: bool = False) -> None:
+        """藏到后台继续记录，并把焦点还给呼出前的窗口；paste=True 时顺手按一下 Ctrl+V。"""
+        target, self._paste_target = self._paste_target, None
+        if target:
+            self.desktop.activate(target)  # 先还焦点再藏窗口，Windows 才肯切过去
+        self.root.withdraw()
+        if target and paste:
+            self.root.after(PASTE_DELAY_MS, self.desktop.paste)
+
+    def _on_close(self) -> None:
+        if not self.history.settings.get("close_hint_shown"):
+            messagebox.showinfo(
+                "还在后台运行哦",
+                "关掉窗口后，剪贴板历史会在后台继续记录。\n\n"
+                f"随时按 {HOTKEY_NAME} 就能把它叫出来；想彻底退出，点窗口里的「退出」。",
+                parent=self.root,
+            )
+            self.history.settings["close_hint_shown"] = True
+            self._save()
+        self.hide()
+
+    def _apply_autostart_setting(self) -> None:
+        # 第一次运行默认开启：开机后自动在后台记录，不用每次手动打开
+        if "autostart" not in self.history.settings:
+            self.history.settings["autostart"] = True
+            self._save()
+        try:
+            # 每次启动都按设置写一遍，程序文件夹挪了位置也能跟着更新
+            self.desktop.set_autostart(self.history.settings["autostart"])
+        except OSError:
+            pass
+        self.autostart.set(self.desktop.autostart)
+
+    def _toggle_autostart(self) -> None:
+        enabled = self.autostart.get()
+        try:
+            self.desktop.set_autostart(enabled)
+        except OSError as error:
+            self.autostart.set(not enabled)
+            self._flash(f"设置失败：{error}")
+            return
+        self.history.settings["autostart"] = enabled
+        self._save()
+        self._flash("开机后会自动在后台运行 ✓" if enabled else "已取消开机自启")
+
     # ---- 按钮和快捷键 ----
 
     def copy_selected(self) -> None:
@@ -247,6 +471,8 @@ class ClipboardHistoryApp:
             self._save()
         self._refresh(select=entry.text)
         self._flash("已复制到剪贴板 ✓")
+        if self._paste_target is not None:
+            self.hide(paste=True)
 
     def delete_selected(self) -> None:
         entry = self._selected_entry()
@@ -278,7 +504,11 @@ class ClipboardHistoryApp:
             self.tree.see(str(index))
         return "break"
 
-    def _reset_search(self) -> None:
+    def _on_escape(self) -> None:
+        """Esc：搜索框有字就先清空；已经是空的，就把窗口收起来（Windows）。"""
+        if not self.query.get() and self.desktop is not None:
+            self.hide()
+            return
         self.query.set("")
         self.search_box.focus_set()
 
@@ -355,20 +585,33 @@ class ClipboardHistoryApp:
         self.status.configure(text=message)
         if self._status_job is not None:
             self.root.after_cancel(self._status_job)
-        self._status_job = self.root.after(3000, lambda: self.status.configure(text=TIP))
+        self._status_job = self.root.after(3000, lambda: self.status.configure(text=self._tip))
 
 
 def main() -> None:
+    desktop = None
     if sys.platform == "win32":
+        python = windowless_python()
+        if python != Path(sys.executable):
+            # 双击 .py 会多出一个黑色命令行窗口，关掉它程序也跟着退出；换成 pythonw 重新启动
+            subprocess.Popen([str(python), str(Path(__file__).resolve()), *sys.argv[1:]])
+            return
         # 告诉 Windows 缩放由我们自己处理，高分屏上字才不会发虚
         try:
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
         except (AttributeError, OSError):
             pass
+        desktop = WindowsDesktop()
+        if not desktop.claim_single_instance():
+            desktop.press_hotkey()  # 已经有一份在后台运行了，把它叫出来就行
+            return
+        desktop.start_hotkey()
     history = ClipboardHistory(path=DATA_FILE)
     history.load()
     root = tk.Tk()
-    ClipboardHistoryApp(root, history)
+    ClipboardHistoryApp(root, history, desktop)
+    if "--hidden" in sys.argv[1:]:
+        root.withdraw()  # 开机自启时不弹窗口，直接在后台待命
     root.mainloop()
 
 
