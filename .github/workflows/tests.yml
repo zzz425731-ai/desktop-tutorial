@@ -1,0 +1,39 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    env:
+      PYTHONUTF8: "1"  # 测试输出里有中文
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: 剪贴板历史
+        working-directory: clipboard-history
+        run: python -m unittest -v
+      - name: 垃圾软件检查
+        if: ${{ !cancelled() }}
+        working-directory: junk-software-checker
+        run: python -m unittest -v
+
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - run: sudo apt-get update && sudo apt-get install -y python3-tk xvfb
+      - name: 剪贴板历史
+        working-directory: clipboard-history
+        run: xvfb-run -a python3 -m unittest -v
+      - name: 垃圾软件检查
+        if: ${{ !cancelled() }}
+        working-directory: junk-software-checker
+        run: xvfb-run -a python3 -m unittest -v
