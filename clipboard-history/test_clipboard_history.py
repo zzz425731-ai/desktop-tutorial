@@ -24,6 +24,48 @@ def texts(entries):
     return [entry.text for entry in entries]
 
 
+def copy_like_password_manager(root, text, formats):
+    """像密码管理器那样复制：除了文字，再放上几个自定义格式（名字 → 4 字节的数值）。只在 Windows 上用。
+
+    等剪贴板的时候要让 root 处理消息：别的程序来要 Tk 之前放进剪贴板的内容时，Tk 得能回应，不然大家一起卡住。
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    user32, kernel32 = ctypes.WinDLL("user32"), ctypes.WinDLL("kernel32")
+    user32.OpenClipboard.argtypes = [wintypes.HWND]
+    user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+    user32.SetClipboardData.restype = wintypes.HANDLE
+    user32.RegisterClipboardFormatW.argtypes = [wintypes.LPCWSTR]
+    user32.RegisterClipboardFormatW.restype = wintypes.UINT
+    kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+    kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+    kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+
+    def put(fmt, data):
+        handle = kernel32.GlobalAlloc(0x0002, len(data))  # GMEM_MOVEABLE
+        ctypes.memmove(kernel32.GlobalLock(handle), data, len(data))
+        kernel32.GlobalUnlock(handle)
+        user32.SetClipboardData(fmt, handle)
+
+    for _ in range(100):  # 剪贴板可能正被别的程序占着，稍等再试
+        if user32.OpenClipboard(None):
+            break
+        root.update()
+        time.sleep(0.02)
+    else:
+        raise OSError("打不开剪贴板")
+    try:
+        user32.EmptyClipboard()
+        put(13, (text + "\0").encode("utf-16-le"))  # CF_UNICODETEXT
+        for name, value in formats.items():
+            put(user32.RegisterClipboardFormatW(name), value.to_bytes(4, "little"))
+    finally:
+        user32.CloseClipboard()
+
+
 class FakeDesktop:
     """假装是 Windows：只记下程序想做什么，不真的去按键盘、改注册表。"""
 
@@ -36,6 +78,10 @@ class FakeDesktop:
         self.activated = []
         self.pastes = 0
         self.autostart = False
+        self.private = False  # 剪贴板里的内容是不是标了「别记录」
+
+    def clipboard_is_private(self):
+        return self.private
 
     def foreground(self):
         return self.front
@@ -276,6 +322,18 @@ class BackgroundModeTest(unittest.TestCase):
         self.app.check_hotkey()
         self.root.update()
 
+    def test_password_manager_copies_are_not_recorded(self):
+        self.desktop.private = True
+        self.root.clipboard_clear()
+        self.root.clipboard_append("my-password")
+        self.app.check_clipboard()
+        self.assertNotIn("my-password", texts(self.history.items))
+        self.desktop.private = False
+        self.root.clipboard_clear()
+        self.root.clipboard_append("普通文字")
+        self.app.check_clipboard()
+        self.assertEqual(self.history.items[0].text, "普通文字")
+
     def test_first_run_turns_on_autostart(self):
         self.assertTrue(self.desktop.autostart)
         self.assertTrue(self.app.autostart.get())
@@ -379,6 +437,29 @@ class WindowsDesktopTest(unittest.TestCase):
         self.assertTrue(command.endswith("--hidden"))
         desktop.set_autostart(False)
         self.assertFalse(desktop.autostart)
+
+    def test_password_manager_copies_are_not_recorded(self):
+        root = make_root(self)
+        history = ClipboardHistory()
+        history.settings["close_hint_shown"] = True
+        app = ClipboardHistoryApp(root, history, self.desktop())
+        cases = [
+            ("排除标记", {"ExcludeClipboardContentFromMonitorProcessing": 0}, False),
+            ("不进历史", {"CanIncludeInClipboardHistory": 0}, False),
+            ("允许进历史", {"CanIncludeInClipboardHistory": 1}, True),
+            ("普通复制", {}, True),
+        ]
+        for text, formats, recorded in cases:
+            with self.subTest(text=text):
+                copy_like_password_manager(root, text, formats)
+                # 别的剪贴板工具可能正好占着剪贴板，读到这次复制的内容为止
+                deadline = time.time() + 3
+                while app._last_seen != text and time.time() < deadline:
+                    app.check_clipboard()
+                    root.update()
+                    time.sleep(0.02)
+                self.assertEqual(app._last_seen, text, "没读到这次复制的内容")
+                self.assertEqual(text in texts(history.items), recorded)
 
     def test_only_one_copy_runs_at_a_time(self):
         first = self.desktop()

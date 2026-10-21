@@ -130,12 +130,29 @@ class WindowsDesktop:
     WM_HOTKEY, KEYEVENTF_KEYUP, ERROR_ALREADY_EXISTS = 0x0312, 0x0002, 183
     RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
     AUTOSTART_NAME = "ClipboardHistory"
+    # 密码管理器复制密码时会给剪贴板加上这些标记，意思是「别记录我」；Windows 自带的剪贴板历史（Win+V）也认
+    PRIVATE_FORMATS = ("ExcludeClipboardContentFromMonitorProcessing", "Clipboard Viewer Ignore")
+    HISTORY_FORMAT = "CanIncludeInClipboardHistory"  # 值为 0 表示不许进剪贴板历史
 
     def __init__(self) -> None:
         self.hotkey_pressed = threading.Event()
         self.hotkey_ok = False
         self._mutex = None
         user32 = self.user32 = ctypes.WinDLL("user32")
+        user32.RegisterClipboardFormatW.argtypes = [wintypes.LPCWSTR]
+        user32.RegisterClipboardFormatW.restype = wintypes.UINT
+        user32.IsClipboardFormatAvailable.argtypes = [wintypes.UINT]
+        user32.OpenClipboard.argtypes = [wintypes.HWND]
+        user32.GetClipboardData.argtypes = [wintypes.UINT]
+        user32.GetClipboardData.restype = wintypes.HANDLE
+        kernel32 = self.kernel32 = ctypes.WinDLL("kernel32")
+        kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalLock.restype = ctypes.c_void_p
+        kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalSize.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalSize.restype = ctypes.c_size_t
+        self._private_formats = [user32.RegisterClipboardFormatW(name) for name in self.PRIVATE_FORMATS]
+        self._history_format = user32.RegisterClipboardFormatW(self.HISTORY_FORMAT)
         user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
         user32.GetMessageW.argtypes = [
             ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT
@@ -169,6 +186,31 @@ class WindowsDesktop:
         while self.user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
             if msg.message == self.WM_HOTKEY:
                 self.hotkey_pressed.set()
+
+    def clipboard_is_private(self) -> bool:
+        """剪贴板里的内容是不是标了「别记录」（比如密码管理器复制的密码）。"""
+        if any(fmt and self.user32.IsClipboardFormatAvailable(fmt) for fmt in self._private_formats):
+            return True
+        if not (self._history_format and self.user32.IsClipboardFormatAvailable(self._history_format)):
+            return False
+        # 标了 CanIncludeInClipboardHistory 就要看它的值：不是 0 才允许记录；读不出来就当不允许，宁可少记
+        for _ in range(5):  # 剪贴板可能正被别的程序占着，稍等再试
+            if self.user32.OpenClipboard(None):
+                break
+            time.sleep(0.01)
+        else:
+            return True
+        allowed = False
+        try:
+            handle = self.user32.GetClipboardData(self._history_format)
+            if handle and self.kernel32.GlobalSize(handle) >= 4:
+                pointer = self.kernel32.GlobalLock(handle)
+                if pointer:
+                    allowed = ctypes.c_uint32.from_address(pointer).value != 0
+                    self.kernel32.GlobalUnlock(handle)
+        finally:
+            self.user32.CloseClipboard()
+        return not allowed
 
     def foreground(self) -> int:
         return self.user32.GetForegroundWindow() or 0
@@ -370,6 +412,9 @@ class ClipboardHistoryApp:
         if text is None or text == self._last_seen:
             return
         self._last_seen = text
+        # 密码管理器复制的密码会带「别记录」标记：不显示，也不写进文件
+        if self.desktop is not None and self.desktop.clipboard_is_private():
+            return
         if self.history.add(text):
             self._save()
             self._refresh(select=text)

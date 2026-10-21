@@ -1,3 +1,4 @@
+import os
 import sys
 import time
 import tkinter as tk
@@ -96,6 +97,18 @@ class RuleTest(unittest.TestCase):
     def test_startup_command_path_is_checked_too(self):
         self.assertEqual(STARTUP[1].rule.label, "2345 全家桶")
         self.assertIsNone(STARTUP[0].rule)
+
+    def test_user_name_is_not_mistaken_for_junk(self):
+        """用户名碰巧含有关键词（比如 hao123）时，这个用户的正常开机启动项不能被当成垃圾软件。"""
+        with mock.patch.dict(os.environ, {"USERPROFILE": "C:\\Users\\hao123"}):
+            onedrive = StartupItem(
+                "OneDrive", r'"C:\Users\hao123\AppData\Local\Microsoft\OneDrive\OneDrive.exe" /background', "注册表（当前用户）"
+            )
+            shortcut = StartupItem("记事本", r'"c:\users\HAO123\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\记事本.lnk"', "启动文件夹（当前用户）")
+            junk = StartupItem("Helper", r'"C:\Users\hao123\AppData\Roaming\2345Soft\helper.exe"', "注册表（当前用户）")
+            self.assertIsNone(onedrive.rule)
+            self.assertIsNone(shortcut.rule)
+            self.assertEqual(junk.rule.label, "2345 全家桶")  # 用户文件夹里装的真垃圾软件照样认得出
 
     def test_windows_own_startup_items_are_recognised(self):
         self.assertTrue(STARTUP[2].is_system)

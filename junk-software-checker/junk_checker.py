@@ -92,6 +92,15 @@ def find_rule(*texts: str) -> Rule | None:
     return None
 
 
+def hide_user_folder(command: str) -> str:
+    """比对前把命令里的用户文件夹（C:\\Users\\用户名）换成 %USERPROFILE%：
+    用户名碰巧含有关键词（比如 hao123）时，不能把这个用户的所有开机启动项都当成垃圾软件。"""
+    profile = os.environ.get("USERPROFILE", "").rstrip("\\/")
+    if not profile:
+        return command
+    return re.sub(re.escape(profile), lambda _match: "%USERPROFILE%", command, flags=re.IGNORECASE)
+
+
 @dataclass
 class Program:
     name: str
@@ -121,7 +130,7 @@ class StartupItem:
 
     @cached_property
     def rule(self) -> Rule | None:
-        return find_rule(self.name, self.command)
+        return find_rule(self.name, hide_user_folder(self.command))
 
     @cached_property
     def is_system(self) -> bool:
